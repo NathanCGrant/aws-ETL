@@ -1,0 +1,72 @@
+Content-Type: multipart/mixed; boundary="//"
+MIME-Version: 1.0
+
+--//
+Content-Type: text/cloud-config; charset="us-ascii"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+Content-Disposition: attachment; filename="cloud-config.txt"
+
+#cloud-config
+cloud_final_modules:
+- [scripts-user, always]
+
+--//
+Content-Type: text/x-shellscript; charset="us-ascii"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+Content-Disposition: attachment; filename="userdata.txt"
+
+#!/bin/bash
+exec > /var/log/user-data.log 2>&1
+set -xe
+yum update -y
+yum install -y telnet docker jq aws-cli
+service docker start
+usermod -a -G docker ec2-user
+chkconfig docker on
+CONTAINERS=$(docker ps -aq)
+if [ -n "$CONTAINERS" ]; then
+  docker stop "$CONTAINERS" || true
+  docker rm "$CONTAINERS" || true
+fi
+su ec2-user -c 'docker volume create grafana-storage'
+mkdir -p /home/ec2-user/grafana-provisioning/{datasources,dashboards}
+PARAM=$(aws ssm get-parameter --name "beanme_app_redshift_settings" --with-decryption --query "Parameter.Value" --output text --region eu-west-1)
+HOST=$(echo "$PARAM" | jq -r '."host"')
+PORT=$(echo "$PARAM" | jq -r '."port"')
+DB=$(echo "$PARAM" | jq -r '."database-name"')
+USER=$(echo "$PARAM" | jq -r '."user"')
+PASS=$(echo "$PARAM" | jq -r '."password"')
+cat > /home/ec2-user/grafana-provisioning/datasources/sources.yaml <<EOF
+apiVersion: 1
+datasources:
+- name: BeanMeApp Redshift
+  type: postgres
+  url: ${HOST}:${PORT}
+  user: ${USER}
+  secureJsonData:
+    password: ${PASS}
+  database: ${DB}
+  jsonData:
+    sslmode: 'require'
+    postgresVersion: 1200
+    timescaledb: false
+  isDefault: true
+  editable: true
+- name: BeanMeApp CloudWatch
+  type: cloudwatch
+  jsonData:
+    authType: default
+    defaultRegion: eu-west-1
+  editable: true
+EOF
+echo '<h1>Swagger disabled</h1>' > /home/ec2-user/no-swagger.html
+chown -R ec2-user:ec2-user /home/ec2-user/grafana-provisioning
+su ec2-user -c 'docker run -d -p 80:3000 --name grafana \
+  -v /home/ec2-user/no-swagger.html:/usr/share/grafana/public/views/swagger.html \
+  -v /home/ec2-user/grafana-provisioning:/etc/grafana/provisioning \
+  -v grafana-storage:/var/lib/grafana \
+  -e "GF_AWS_PROFILES=default" \
+  -e "GF_AWS_DEFAULT_REGION=eu-west-1" \
+  grafana/grafana'

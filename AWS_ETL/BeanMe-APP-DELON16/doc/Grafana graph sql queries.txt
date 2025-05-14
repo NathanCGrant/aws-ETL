@@ -1,0 +1,76 @@
+Total revenue
+
+SELECT 
+    SUM(total_spend) 
+FROM delon16.transactions LIMIT 50 
+
+---
+
+Revenue % by Location
+
+WITH location_revenues AS (
+    SELECT 
+        l.id AS location_id,
+        l.town,
+        SUM(t.total_spend) AS revenue
+    FROM transactions t
+    JOIN locations l ON t.location_id = l.id
+    WHERE t.location_id IS NOT NULL
+    GROUP BY t.location_id
+)
+SELECT 
+    lr.town,
+    ROUND((lr.revenue / SUM(lr.revenue) OVER()) * 100, 0) AS percentage_of_total
+FROM location_revenues lr;
+
+---
+
+Revenue (UKP) by Location
+
+WITH location_revenues AS (
+    SELECT 
+        l.id AS location_id,
+        l.town,
+        SUM(t.total_spend) AS revenue
+    FROM transactions t
+    JOIN locations l ON t.location_id = l.id
+    WHERE t.location_id IS NOT NULL
+    GROUP BY t.location_id
+)
+SELECT 
+    lr.town,
+    ROUND(lr.revenue, 2) AS revenue_rounded
+FROM location_revenues lr 
+ORDER BY lr.revenue DESC;
+
+---
+
+Sales (units) by Location
+
+SELECT 
+    locations.town, 
+    COUNT(*) AS product_count 
+FROM baskets join transactions on baskets.transaction_id = transactions.id 
+             join locations on transactions.location_id = locations.id 
+GROUP BY locations.town 
+ORDER BY product_count DESC;
+
+---
+
+Sales (units) by Product
+
+SELECT 
+    p.name AS product, 
+    COUNT(*) AS quantity 
+FROM baskets b JOIN products p ON b.product_id = p.id 
+GROUP BY p.name 
+ORDER BY quantity DESC;
+
+---
+
+Sales over time
+
+SELECT 
+    time, total_spend 
+FROM delon16.transactions LIMIT 50 
+

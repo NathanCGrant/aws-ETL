@@ -1,0 +1,5 @@
+dotenv==0.9.9
+psycopg2==2.9.10
+pytest==8.3.5
+python-dotenv==1.0.1
+moto==5.1.4

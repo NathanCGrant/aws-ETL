@@ -1,0 +1,67 @@
+services:
+  db:
+    image: docker.io/postgres:latest
+    container_name: supercafe-postgres
+    restart: always
+    ports:
+      - "5432:5432"
+    env_file:
+      - .env
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - supercafe-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 30s
+      retries: 3
+      timeout: 10s
+      start_period: 10s
+
+  adminer:
+    image: docker.io/adminer
+    container_name: supercafe-adminer
+    restart: always
+    ports:
+      - "8080:8080"
+    networks:
+      - supercafe-network
+    depends_on:
+      - db
+    healthcheck:
+      test: ["CMD-SHELL", "curl --silent --fail http://localhost:8080 || exit 1"]
+      interval: 30s
+      retries: 3
+      timeout: 10s
+      start_period: 10s
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: supercafe-grafana
+    restart: always
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    volumes:
+      - ./datasource.yaml:/etc/grafana/provisioning/datasources/datasource.yaml
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - db
+    networks:
+      - supercafe-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl --silent --fail http://localhost:3000 || exit 1"]
+      interval: 30s
+      retries: 3
+      timeout: 10s
+      start_period: 10s
+
+networks:
+  supercafe-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  grafana_data:

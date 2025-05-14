@@ -1,0 +1,554 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Cloudformation template for BeanMeApp ETL pipeline with SNS notifications
+
+# ================== #
+# Parameters Section #
+# ================== #
+
+Parameters:
+
+  TeamName:
+    Type: String
+    Default: beanmeapp
+    Description: Enter the team name you want to use for DB connections
+  
+  NetworkStackName:
+    Type: String
+    Default: project-networking
+    Description: Network stack with VPC containing Redshift instance
+
+  KeyName:
+    Type: String
+    Description: EC2 Key Pair Name
+    Default: beanmeapp-key
+  
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+    Description: Automatically look up the latest AMI for Amazon Linux v2
+
+  EC2InstanceProfileRoleName:
+    Type: String
+    Default: de-academy-ec2-role-instance-profile
+    Description: The shared EC2 instance profile name to use
+  
+  EC2InstanceIngressIp:
+    Type: String
+    Description: Custom IP address for Grafana HTTP ingress rule
+  
+  EC2UserData:
+    Type: String
+    Default: ""
+    Description: User data script to run on EC2 server boot
+    
+  AlertEmailAddress:
+    Type: String
+    Description: Email address to receive SNS notifications
+    Default: atalaye@genstudents.org
+
+# ================= #
+# Resources Section #
+# ================= #
+
+Resources:
+
+  # --------- #
+  # SNS Topic #
+  # --------- #
+
+  ETLNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${TeamName}-etl-notifications'
+      DisplayName: !Sub '${TeamName} ETL Notifications'
+      Tags:
+        - Key: Name
+          Value: !Sub '${TeamName}-etl-notifications'
+
+  ETLNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ETLNotificationTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmailAddress
+
+  # ---------------- #
+  # Lambda Functions #
+  # ---------------- #
+
+  TransformLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${TeamName}-transform-lambda'
+      Runtime: python3.12
+      Handler: transform_handler.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/lambda-execution-role'
+      Timeout: 30
+      Code:
+        S3Bucket: !Sub '${TeamName}-deployment-bucket'
+        S3Key: !Sub 'transform.zip'
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub '${NetworkStackName}-VPCSGID'
+        SubnetIds:
+          - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet0ID'
+      Environment:
+        Variables:
+          CLEAN_BUCKET: !Sub '${TeamName}-clean-data'
+          SNS_TOPIC_ARN: !Ref ETLNotificationTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${TeamName}-transform-lambda'
+
+  ExtractLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${TeamName}-extract-lambda'
+      Runtime: python3.12
+      Handler: extract_handler.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/lambda-execution-role'
+      Timeout: 30
+      Code:
+        S3Bucket: !Sub '${TeamName}-deployment-bucket'
+        S3Key: !Sub 'extract.zip'
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub '${NetworkStackName}-VPCSGID'
+        SubnetIds:
+          - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet0ID'
+      Environment:
+        Variables:
+          RAW_BUCKET: !Sub '${TeamName}-raw-data'
+          TRANSFORM_QUEUE_URL: !GetAtt ExtractToTransformQueue.QueueUrl
+          SNS_TOPIC_ARN: !Ref ETLNotificationTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${TeamName}-extract-lambda'
+  
+  LoadLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${TeamName}-load-lambda'
+      Runtime: python3.12
+      Handler: load_handler.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/lambda-execution-role'
+      Timeout: 30
+      Code:
+        S3Bucket: !Sub '${TeamName}-deployment-bucket'
+        S3Key: !Sub 'load.zip'
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub '${NetworkStackName}-VPCSGID'
+        SubnetIds:
+          - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet0ID'
+      Environment:
+        Variables:
+          CLEAN_BUCKET: !Sub '${TeamName}-clean-data'
+          SSM_PARAMETER_NAME:
+            Fn::Join:
+            - '_'
+            - Fn::Split:
+              - '-'
+              - !Sub 'beanme_app_redshift_settings'
+          SNS_TOPIC_ARN: !Ref ETLNotificationTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${TeamName}-load-lambda'
+  
+  CreateTablesLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${TeamName}-create-tables-lambda'
+      Runtime: python3.12
+      Handler: create_tables_handler.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/lambda-execution-role'
+      Timeout: 30
+      Code:
+        S3Bucket: !Sub '${TeamName}-deployment-bucket'
+        S3Key: !Sub 'create_tables.zip'
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub '${NetworkStackName}-VPCSGID'
+        SubnetIds:
+          - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet0ID'
+      Environment:
+        Variables:
+          SSM_PARAMETER_NAME:
+            Fn::Join:
+            - '_'
+            - Fn::Split:
+              - '-'
+              - !Sub 'beanme_app_redshift_settings'
+          SNS_TOPIC_ARN: !Ref ETLNotificationTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${TeamName}-create-tables-lambda'
+  
+  RedshiftCustomResource:
+    Type: Custom::CreateRedshiftTable
+    Properties:
+      ServiceToken: !GetAtt CreateTablesLambdaFunction.Arn
+  
+  # Lambda Function Alarm for errors
+  ExtractLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${TeamName}-extract-lambda-errors'
+      AlarmDescription: 'Alarm if the Extract Lambda function has errors'
+      Namespace: 'AWS/Lambda'
+      MetricName: 'Errors'
+      Dimensions:
+        - Name: 'FunctionName'
+          Value: !Ref ExtractLambdaFunction
+      ComparisonOperator: 'GreaterThanThreshold'
+      Threshold: 0
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: 'Sum'
+      AlarmActions:
+        - !Ref ETLNotificationTopic
+
+  TransformLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${TeamName}-transform-lambda-errors'
+      AlarmDescription: 'Alarm if the Transform Lambda function has errors'
+      Namespace: 'AWS/Lambda'
+      MetricName: 'Errors'
+      Dimensions:
+        - Name: 'FunctionName'
+          Value: !Ref TransformLambdaFunction
+      ComparisonOperator: 'GreaterThanThreshold'
+      Threshold: 0
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: 'Sum'
+      AlarmActions:
+        - !Ref ETLNotificationTopic
+
+  LoadLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${TeamName}-load-lambda-errors'
+      AlarmDescription: 'Alarm if the Load Lambda function has errors'
+      Namespace: 'AWS/Lambda'
+      MetricName: 'Errors'
+      Dimensions:
+        - Name: 'FunctionName'
+          Value: !Ref LoadLambdaFunction
+      ComparisonOperator: 'GreaterThanThreshold'
+      Threshold: 0
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: 'Sum'
+      AlarmActions:
+        - !Ref ETLNotificationTopic
+
+  # ---------- #
+  # S3 Buckets #
+  # ---------- #
+
+  ShopperRawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${TeamName}-raw-data'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ExtractLambdaFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .csv
+      Tags:
+        - Key: Name
+          Value: !Sub '${TeamName}-raw-data'
+
+  ShopperCleanDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${TeamName}-clean-data'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt LoadLambdaFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .csv
+      Tags:
+        - Key: Name
+          Value: !Sub '${TeamName}-clean-data'
+
+  # ------------------ #
+  # Lambda Permissions #
+  # ------------------ #
+
+  ShopperRawDataBucketPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ExtractLambdaFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${TeamName}-raw-data'
+  
+  ShopperCleanDataBucketPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref LoadLambdaFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${TeamName}-clean-data'
+
+  ShopperRawDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ShopperRawDataBucket
+      PolicyDocument:
+        Statement:
+          - Sid: "AllowSSLRequestsOnly"
+            Action: "s3:*"
+            Principal: "*"
+            Effect: "Deny"
+            Resource:
+              - !Sub "arn:aws:s3:::${TeamName}-raw-data"
+              - !Sub "arn:aws:s3:::${TeamName}-raw-data/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+  
+  ShopperCleanDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ShopperCleanDataBucket
+      PolicyDocument:
+        Statement:
+          - Sid: "AllowSSLRequestsOnly"
+            Action: "s3:*"
+            Principal: "*"
+            Effect: "Deny"
+            Resource:
+              - !Sub "arn:aws:s3:::${TeamName}-clean-data"
+              - !Sub "arn:aws:s3:::${TeamName}-clean-data/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ----------- #
+  # SQS Queues  #
+  # ----------- #
+
+  ExtractToTransformQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${TeamName}-extract-transform-queue'
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ExtractToTransformDLQ.Arn
+        maxReceiveCount: 3
+
+  ExtractToTransformDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${TeamName}-extract-transform-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # Alarm for SQS Dead Letter Queue
+  ExtractToTransformDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${TeamName}-extract-transform-dlq-alarm'
+      AlarmDescription: 'Alarm if messages are sent to the DLQ'
+      Namespace: 'AWS/SQS'
+      MetricName: 'ApproximateNumberOfMessagesVisible'
+      Dimensions:
+        - Name: 'QueueName'
+          Value: !GetAtt ExtractToTransformDLQ.QueueName
+      ComparisonOperator: 'GreaterThanThreshold'
+      Threshold: 0
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: 'Sum'
+      AlarmActions:
+        - !Ref ETLNotificationTopic
+
+  TransformLambdaSQSEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ExtractToTransformQueue.Arn
+      FunctionName: !Ref TransformLambdaFunction
+      BatchSize: 1
+      Enabled: true
+
+  # ------------------------ #
+  # EC2 Instance for Grafana #
+  # ------------------------ #
+  
+  GrafanaEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyName
+      Tags:
+        - Key: Name
+          Value: !Sub '${TeamName}-ec2-grafana'
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: "0"
+          SubnetId:
+            Fn::ImportValue:
+              !Sub '${NetworkStackName}-PublicSubnet0ID'
+          GroupSet:
+            - Fn::ImportValue: !Sub '${NetworkStackName}-VPCSGID'
+            - !GetAtt [GrafanaEC2InstanceSecurityGroup, GroupId]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref GrafanaEC2LaunchTemplate
+        Version: !GetAtt GrafanaEC2LaunchTemplate.LatestVersionNumber
+
+  GrafanaEC2LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${TeamName}-ec2-grafana-launch-template'
+      VersionDescription: '01'
+      LaunchTemplateData:
+        UserData: !Ref EC2UserData
+        IamInstanceProfile:
+          Name: !Ref EC2InstanceProfileRoleName
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpProtocolIpv6: disabled
+          HttpPutResponseHopLimit: 10
+          HttpTokens: required
+          InstanceMetadataTags: enabled
+        Monitoring:
+          Enabled: True
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: 8
+              Encrypted: true
+              DeleteOnTermination: true
+
+  GrafanaEC2InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Sets ingress and egress rules for HTTP, HTTPS and SSH
+      Tags:
+        - Key: Name
+          Value: !Sub '${TeamName}-ec2-grafana'
+      VpcId:
+        Fn::ImportValue:
+          !Sub '${NetworkStackName}-VPCID'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Sub '${EC2InstanceIngressIp}/32'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Sub '${EC2InstanceIngressIp}/32'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Sub '${EC2InstanceIngressIp}/32'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  
+  # Alarm for EC2 state
+  GrafanaEC2StatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${TeamName}-grafana-ec2-status-alarm'
+      AlarmDescription: 'Alarm if the EC2 instance status check fails'
+      Namespace: 'AWS/EC2'
+      MetricName: 'StatusCheckFailed'
+      Dimensions:
+        - Name: 'InstanceId'
+          Value: !Ref GrafanaEC2Instance
+      ComparisonOperator: 'GreaterThanThreshold'
+      Threshold: 0
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: 'Maximum'
+      AlarmActions:
+        - !Ref ETLNotificationTopic
+
+  # CloudWatch alarm for EC2 CPU utilization
+  GrafanaEC2CPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${TeamName}-grafana-ec2-cpu-alarm'
+      AlarmDescription: 'Alarm if the CPU exceeds 80% for 5 minutes'
+      Namespace: 'AWS/EC2'
+      MetricName: 'CPUUtilization'
+      Dimensions:
+        - Name: 'InstanceId'
+          Value: !Ref GrafanaEC2Instance
+      ComparisonOperator: 'GreaterThanThreshold'
+      Threshold: 80
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: 'Average'
+      AlarmActions:
+        - !Ref ETLNotificationTopic
+
+# =============== #
+# Outputs Section #
+# =============== #
+
+Outputs:
+
+  ExtractLambdaFunctionName:
+    Description: Lambda Function Name
+    Value: !Ref ExtractLambdaFunction
+
+  TransformLambdaFunctionName:
+    Description: Lambda Function Name
+    Value: !Ref TransformLambdaFunction
+  
+  LoadLambdaFunctionName:
+    Description: Lambda Function Name
+    Value: !Ref LoadLambdaFunction
+
+  ShopperRawDataBucketName:
+    Description: Name of the S3 bucket for raw shopper data
+    Value: !Ref ShopperRawDataBucket
+
+  ShopperCleanDataBucketName:
+    Description: Name of the S3 bucket for clean shopper data
+    Value: !Ref ShopperCleanDataBucket
+
+  GrafanaInstanceId:
+    Description: EC2 instance ID for Grafana
+    Value: !Ref GrafanaEC2Instance
+
+  ExtractToTransformQueueURL:
+    Description: SQS Queue URL used between extract and transform lambdas
+    Value: !GetAtt ExtractToTransformQueue.QueueUrl
+
+  ETLNotificationTopicARN:
+    Description: ARN of the SNS Topic for ETL notifications
+    Value: !Ref ETLNotificationTopic

@@ -1,0 +1,40 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Cloudformation template for BeanMeApp deployment bucket 
+
+Parameters:
+  TeamName:
+    Type: String
+    Description: Enter your team name
+    Default: beanmeapp
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${TeamName}-deployment-bucket'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      Tags:
+        - Key: Name
+          Value: !Sub '${TeamName}-deployment-bucket'
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Statement:
+          - Sid: "AllowSSLRequestsOnly"
+            Action: "s3:*"
+            Principal: "*"
+            Effect: "Deny"
+            Resource:
+              - !Sub "arn:aws:s3:::${TeamName}-deployment-bucket"
+              - !Sub "arn:aws:s3:::${TeamName}-deployment-bucket/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
